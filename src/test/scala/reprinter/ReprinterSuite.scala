@@ -1,52 +1,28 @@
 package reprinter
 
 import org.scalatest.FunSuite
+import org.langmeta.inputs.{Input, Position}
+import System.{lineSeparator => nl}
 
-import org.langmeta.inputs.Input
-
-import fastparse.all._
-
-case class Ast(decls: List[Decl])
-case class Decl(span: Span, name: String, expr: Expr)
+case class Ast(decls: List[Decl]) {
+  override def toString: String = decls.mkString(nl)
+}
+case class Decl(pos: Position, name: String, expr: Expr) {
+  override def toString: String = s"$name = $expr"
+}
 
 sealed trait Expr
-case class Plus(refactored: Boolean, span: Span, lhs: Expr, rhs: Expr) extends Expr
-case class Var(refactored: Boolean, span: Span, name: String) extends Expr
-case class Const(refactored: Boolean, span: Span, value: Int) extends Expr
-
-class AstParser(input: String) {
-  val metaInput = Input.String(input)
-  def pos(offset: Int): Position = ???
-  def span(startOffset: Int, endOffset: Int): Span = Span(pos(startOffset), pos(endOffset))
-  val number: P[Int] = P(CharIn('0'to'9').rep(1).!.map(_.toInt))
-  val name: P[String] = P(CharIn('a' to 'z').rep(1).!)
-  def wrapSpan[A, B](p: P[A])(f: (A, Span) => B): P[B] =
-    (Index ~ p ~ Index).map {case (start, v, end) => f(v, span(start, end))}
-  val const: P[Const] = wrapSpan(number){ case (v, s) => Const(false, s, v) }
-  val `var`: P[Var] = wrapSpan(name){ case (v, s) => Var(false, s, v)}
-  val plus: P[Plus] = wrapSpan(P("+(" ~ expr ~ "," ~ expr ~ ")")){
-    case ((e1, e2), s) => Plus(false, s, e1, e2)
-  }
-  val expr: P[Expr] = const | `var` | plus
-  val decl: P[Decl] = wrapSpan(name ~ "=" ~ expr){
-    case ((n, e), s) => Decl(s, n, e)
-  }
-  val ast: P[Ast] = decl.rep.map(decls => Ast(decls.toList))
-
-  def result: Ast = ast.parse(input).get.value
+case class Plus(refactored: Boolean, pos: Position, lhs: Expr, rhs: Expr) extends Expr {
+  override def toString: String = s"+($lhs, $rhs)"
+}
+case class Var(refactored: Boolean, pos: Position, name: String) extends Expr {
+  override def toString: String = name
+}
+case class Const(refactored: Boolean, pos: Position, value: Int) extends Expr {
+  override def toString: String = value.toString
 }
 
-class ReprinterSuite() extends FunSuite {
-  val input = 
-    """|x = +(1,2)
-       |y = +(x, 0)
-       |// Calculate z
-       |z = +( 1, +(+(0,x) ,y) )""".stripMargin
-
-  val ast = RefactorZero(new AstParser(input).result)
-}
-
-object RefactorZero extends RefactorUtils{
+object RefactorZero extends RefactorUtils {
   def apply(ast: Ast): Ast = refactorLoop(refactorZeroOnce)(ast)
   def refactorZeroOnce(ast: Ast): Ast = {
     def go(expr: Expr): Expr = {
@@ -58,15 +34,65 @@ object RefactorZero extends RefactorUtils{
       }
     }
 
-    def markRefactored(expr: Expr, s: Span): Expr = {
+    def markRefactored(expr: Expr, pos: Position): Expr = {
       expr match {
-        case Plus(_, _, e1, e2) => Plus(true, s, e1, e2)
-        case Var(_, _, n) => Var(true, s, n)
-        case Const(_, _, i) => Const(true, s, i)
+        case Plus(_, _, e1, e2) => Plus(true, pos, e1, e2)
+        case Var(_, _, n) => Var(true, pos, n)
+        case Const(_, _, i) => Const(true, pos, i)
       }
     }
     ast.copy(decls = ast.decls.map(d => d.copy(expr = go(d.expr))))
   }
+}
+
+class ReprinterSuite() extends FunSuite {
+  val input = 
+    """|x = +(1,2)
+       |y = +(x, 0)
+       |// Calculate z
+       |z = +( 1, +(+(0,x) ,y) )""".stripMargin
+
+    
+  val ast0 = new AstParser(input).result
+  val ast = RefactorZero(ast0)
+
+  println(ast0)
+  println()
+  println(ast)
+}
+
+class AstParser(input: String) {
+  val IgnoreSpaces = fastparse.WhitespaceApi.Wrapper{
+    import fastparse.all._
+    NoTrace(" ".rep)
+  }
+  import fastparse.noApi._
+  import IgnoreSpaces._
+
+  val metaInput = Input.String(input)
+  def pos(startOffset: Int, endOffset: Int): Position =
+    Position.Range(metaInput, startOffset, endOffset)
+  val number: P[Int] = P(CharIn('0'to'9').rep(1).!.map(_.toInt))
+  val name: P[String] = P(CharIn('a' to 'z').rep(1).!)
+  def wrapPos[A, B](p: P[A])(f: (A, Position) => B): P[B] =
+    (Index ~ p ~ Index).map {case (start, v, end) => f(v, pos(start, end))}
+  val const: P[Const] = wrapPos(number){ case (v, pos) => Const(false, pos, v) }
+  val `var`: P[Var] = wrapPos(name){ case (v, pos) => Var(false, pos, v)}
+  val plus: P[Plus] = wrapPos(P("+(" ~ expr ~ "," ~ expr ~ ")")){
+    case ((e1, e2), pos) => Plus(false, pos, e1, e2)
+  }
+  val expr: P[Expr] = const | `var` | plus
+  val decl: P[Decl] = wrapPos(name ~ "=" ~ expr){
+    case ((n, e), pos) => Decl(pos, n, e)
+  }
+  val comment: P[Unit] = P("//" ~ (!(nl) ~ AnyChar).rep).map(_ => ())
+
+  val ast: P[Ast] = 
+    (Start ~ (decl | comment).rep(sep = nl) ~ End).map(decls => 
+      Ast(decls.collect{ case d: Decl => d }.toList)
+    )
+
+  def result: Ast = ast.parse(input).get.value
 }
 
 trait RefactorUtils {
@@ -76,3 +102,4 @@ trait RefactorUtils {
     else refactorLoop(refactoring)(refactoring(ast0))
   }
 }
+
